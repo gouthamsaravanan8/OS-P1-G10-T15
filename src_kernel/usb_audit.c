@@ -7,6 +7,8 @@
  *   - ioctl commands to retrieve logs, statistics, and configure monitoring.
  *   - A USB notifier callback to detect device hotplug events.
  *   - A circular ring buffer for storing transfer event logs.
+ *   - Automatic mass-copy / burst anomaly detection with configurable
+ *     threshold and sliding time window.
  *   - Comprehensive printk() logging for dmesg debugging.
  *
  * Build:   cd src_kernel && make
@@ -34,6 +36,7 @@
 #include <linux/blkdev.h>         /* block_device operations            */
 #include <linux/timekeeping.h>    /* ktime_get_real_ns                  */
 #include <linux/string.h>         /* strncpy, strnlen                   */
+#include <linux/ktime.h>          /* ktime_t, ktime_sub, ktime_after    */
 
 #include "../include/usb_tracker.h"
 
@@ -71,6 +74,84 @@ static DEFINE_MUTEX(audit_mutex);
 
 /* USB notifier block ---------------------------------------------------- */
 static struct notifier_block usb_nb;
+
+/* Anomaly (mass-copy) detection engine ---------------------------------- */
+static ktime_t  anomaly_ring[USB_AUDIT_ANOMALY_RING_SIZE]; /* timestamp ring  */
+static int      anomaly_ring_idx  = 0;    /* write position in ring           */
+static int      anomaly_ring_count= 0;    /* valid entries in ring            */
+static __u32    anomaly_threshold = USB_AUDIT_DEFAULT_THRESHOLD; /* max ops   */
+static __u32    anomaly_window_ms = USB_AUDIT_DEFAULT_WINDOW_MS; /* window   */
+static ktime_t  anomaly_last_alert;       /* timestamp of last alert raised  */
+
+/* =========================================================================
+ * Anomaly Detection: Check for mass-copy (burst) behaviour
+ * =========================================================================
+ * Records the timestamp of every file-create / file-modify event in a
+ * ring buffer.  On each call, counts how many events fall within the
+ * configured sliding window.  If the count exceeds the threshold and the
+ * cooldown period has elapsed, automatically logs an ALERT event and
+ * emits a printk() warning.
+ *
+ * Called from audit_log_event() while audit_mutex is held.
+ */
+static void anomaly_check_burst(ktime_t now)
+{
+    int i, burst = 0;
+    ktime_t window_start;
+    s64 cooldown_ns;
+
+    /* Record the current event timestamp in the ring. */
+    anomaly_ring[anomaly_ring_idx] = now;
+    anomaly_ring_idx = (anomaly_ring_idx + 1) % USB_AUDIT_ANOMALY_RING_SIZE;
+    if (anomaly_ring_count < USB_AUDIT_ANOMALY_RING_SIZE)
+        anomaly_ring_count++;
+
+    /* Window start = now minus configured window. */
+    window_start = ktime_sub_ns(now, (s64)anomaly_window_ms * 1000000ULL);
+
+    /* Count recent events within the sliding window. */
+    for (i = 0; i < anomaly_ring_count; i++) {
+        int idx = (anomaly_ring_idx - 1 - i + USB_AUDIT_ANOMALY_RING_SIZE)
+                  % USB_AUDIT_ANOMALY_RING_SIZE;
+        if (ktime_after(anomaly_ring[idx], window_start))
+            burst++;
+        else
+            break;  /* ring is chronological — stop at first out-of-window */
+    }
+
+    /* Cooldown: don't spam alerts. */
+    cooldown_ns = (s64)USB_AUDIT_ANOMALY_COOLDOWN_MS * 1000000LL;
+
+    if (burst > (int)anomaly_threshold &&
+        ktime_to_ns(ktime_sub(now, anomaly_last_alert)) > cooldown_ns) {
+
+        anomaly_last_alert = now;
+
+        printk(KERN_WARNING
+               "[usb_audit] *** SECURITY ALERT *** Mass-copy detected!  "
+               "%d file ops within %u ms (threshold=%u)\n",
+               burst, anomaly_window_ms, anomaly_threshold);
+
+        /* Record the alert in the log buffer directly (we already hold
+         * audit_mutex, so skip the lock re-acquire).                      */
+        {
+            usb_audit_log_entry_t *entry = &log_buffer[log_head];
+            entry->event_type    = USB_AUDIT_EVENT_ALERT;
+            entry->pid           = 0;
+            entry->timestamp_ns  = ktime_to_ns(now);
+            entry->file_size     = 0;
+            snprintf(entry->file_name, sizeof(entry->file_name),
+                     "mass_copy: %d ops in %ums", burst, anomaly_window_ms);
+
+            log_head = (log_head + 1) % USB_AUDIT_LOG_MAX;
+            if (log_count < USB_AUDIT_LOG_MAX)
+                log_count++;
+
+            stats.alert_count++;
+            stats.log_count = log_count;
+        }
+    }
+}
 
 /* =========================================================================
  * Helper: Record a log entry into the circular buffer
@@ -112,10 +193,14 @@ static void audit_log_event(enum usb_audit_event_type type,
     case USB_AUDIT_EVENT_FILE_CREATE:
         stats.total_files_created++;
         stats.total_bytes_written += size;
+        /* Feed into anomaly detection engine. */
+        anomaly_check_burst(entry->timestamp_ns);
         break;
     case USB_AUDIT_EVENT_FILE_MODIFY:
         stats.total_files_modified++;
         stats.total_bytes_written += size;
+        /* Feed into anomaly detection engine. */
+        anomaly_check_burst(entry->timestamp_ns);
         break;
     case USB_AUDIT_EVENT_FILE_DELETE:
         stats.total_files_deleted++;
@@ -411,10 +496,68 @@ static long usb_audit_ioctl(struct file *filp, unsigned int cmd,
         mutex_lock(&audit_mutex);
         memset(&stats, 0, sizeof(stats));
         stats.log_count = log_count;
+        anomaly_ring_count = 0;
+        anomaly_ring_idx   = 0;
         mutex_unlock(&audit_mutex);
         printk(KERN_INFO "[usb_audit] Statistics reset by PID %d\n",
                current->pid);
         break;
+
+    case USB_AUDIT_SET_ANOMALY: {
+        usb_audit_anomaly_t __user *uanom =
+            (usb_audit_anomaly_t __user *)arg;
+        usb_audit_anomaly_t kanom;
+
+        if (copy_from_user(&kanom, uanom, sizeof(kanom)))
+            return -EFAULT;
+
+        mutex_lock(&audit_mutex);
+        if (kanom.threshold > 0)
+            anomaly_threshold = kanom.threshold;
+        if (kanom.window_ms > 0)
+            anomaly_window_ms = kanom.window_ms;
+        mutex_unlock(&audit_mutex);
+
+        printk(KERN_INFO "[usb_audit] Anomaly config set by PID %d: "
+               "threshold=%u window=%ums\n",
+               current->pid, anomaly_threshold, anomaly_window_ms);
+        break;
+    }
+
+    case USB_AUDIT_GET_ANOMALY: {
+        usb_audit_anomaly_t __user *uanom =
+            (usb_audit_anomaly_t __user *)arg;
+        usb_audit_anomaly_t kanom;
+        int i, burst = 0;
+        ktime_t now, window_start;
+
+        memset(&kanom, 0, sizeof(kanom));
+        now = ktime_get_real();
+
+        mutex_lock(&audit_mutex);
+        kanom.threshold = anomaly_threshold;
+        kanom.window_ms = anomaly_window_ms;
+
+        /* Count recent file ops within the current window. */
+        window_start = ktime_sub_ns(now,
+                                    (s64)anomaly_window_ms * 1000000ULL);
+        for (i = 0; i < anomaly_ring_count; i++) {
+            int idx = (anomaly_ring_idx - 1 - i +
+                       USB_AUDIT_ANOMALY_RING_SIZE)
+                      % USB_AUDIT_ANOMALY_RING_SIZE;
+            if (ktime_after(anomaly_ring[idx], window_start))
+                burst++;
+            else
+                break;
+        }
+        kanom.burst_count = (__u32)burst;
+        kanom.alert_triggered = (burst > (int)anomaly_threshold) ? 1 : 0;
+        mutex_unlock(&audit_mutex);
+
+        if (copy_to_user(uanom, &kanom, sizeof(kanom)))
+            ret = -EFAULT;
+        break;
+    }
 
     default:
         ret = -ENOTTY;
@@ -494,8 +637,12 @@ static int __init usb_audit_init(void)
     memset(log_buffer, 0,
            USB_AUDIT_LOG_MAX * sizeof(usb_audit_log_entry_t));
 
-    /* -- 5. Initialise statistics ------------------------------------- */
+    /* -- 5. Initialise statistics and anomaly detection --------------- */
     memset(&stats, 0, sizeof(stats));
+    memset(anomaly_ring, 0, sizeof(anomaly_ring));
+    anomaly_ring_idx   = 0;
+    anomaly_ring_count = 0;
+    anomaly_last_alert = ktime_set(0, 0);  /* allow immediate first alert */
 
     /* -- 6. Register USB hotplug notifier ----------------------------- */
     usb_nb.notifier_call = usb_audit_notify;

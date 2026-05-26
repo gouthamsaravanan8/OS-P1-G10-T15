@@ -40,8 +40,14 @@
 /* Reset all statistics counters to zero (logs are preserved). */
 #define USB_AUDIT_RESET_STATS    _IO(USB_AUDIT_MAGIC, 5)
 
+/* Configure anomaly detection thresholds. */
+#define USB_AUDIT_SET_ANOMALY    _IOW(USB_AUDIT_MAGIC, 6, usb_audit_anomaly_t)
+
+/* Retrieve current anomaly detection status (recent burst count). */
+#define USB_AUDIT_GET_ANOMALY    _IOR(USB_AUDIT_MAGIC, 7, usb_audit_anomaly_t)
+
 /* Maximum number of commands supported. */
-#define USB_AUDIT_MAX_NR         5
+#define USB_AUDIT_MAX_NR         7
 
 /* -------------------------------------------------------------------------
  * Constants
@@ -49,6 +55,12 @@
 #define USB_AUDIT_DEVICE_NAME    "usb_audit"   /* /dev node name          */
 #define USB_AUDIT_LOG_MAX        128           /* max stored log entries  */
 #define USB_AUDIT_PATH_LEN       256           /* max mount-path length   */
+
+/* Default anomaly detection thresholds (can be changed at runtime). */
+#define USB_AUDIT_DEFAULT_THRESHOLD  5        /* max file ops in window  */
+#define USB_AUDIT_DEFAULT_WINDOW_MS  3000     /* sliding window (ms)     */
+#define USB_AUDIT_ANOMALY_COOLDOWN_MS 5000   /* min gap between alerts  */
+#define USB_AUDIT_ANOMALY_RING_SIZE  64       /* recent event timestamps */
 
 /* -------------------------------------------------------------------------
  * Log Event Types
@@ -109,5 +121,21 @@ typedef struct {
     __u32 reserved;
     usb_audit_log_entry_t entries[USB_AUDIT_LOG_MAX];   /* out        */
 } usb_audit_logs_t;
+
+/* -------------------------------------------------------------------------
+ * Anomaly Detection Configuration / Status
+ * -------------------------------------------------------------------------
+ * Used to configure and query the kernel-side mass-copy detection engine.
+ * - threshold : max file ops allowed within the time window before alert.
+ * - window_ms : sliding window size in milliseconds.
+ * - burst_count : (output) current count of recent file ops in window.
+ * - alert_triggered : (output) 1 if an alert fired in the last check.
+ */
+typedef struct {
+    __u32 threshold;          /* in: max ops before alert                */
+    __u32 window_ms;          /* in: sliding window in milliseconds      */
+    __u32 burst_count;        /* out: recent file ops within window      */
+    __u32 alert_triggered;    /* out: 1 if alert condition is met        */
+} usb_audit_anomaly_t;
 
 #endif /* USB_TRACKER_H */

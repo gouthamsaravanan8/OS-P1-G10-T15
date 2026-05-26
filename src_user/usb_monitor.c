@@ -126,6 +126,55 @@ static void print_header(void)
 }
 
 /* -------------------------------------------------------------------------
+ * Subroutine: Check and display kernel-side anomaly status
+ * -------------------------------------------------------------------------
+ * Queries the kernel module for the current burst count and whether an
+ * automatic alert has been triggered.  Prints a prominent warning if so.
+ */
+static void check_anomaly_status(int fd)
+{
+    usb_audit_anomaly_t anom;
+
+    memset(&anom, 0, sizeof(anom));
+
+    if (ioctl(fd, USB_AUDIT_GET_ANOMALY, &anom) < 0) {
+        /* GET_ANOMALY may not be supported by older module versions. */
+        return;
+    }
+
+    if (anom.alert_triggered) {
+        printf("\n");
+        printf("  ╔══════════════════════════════════════════════════════╗\n");
+        printf("  ║  *** SECURITY ALERT ***                              ║\n");
+        printf("  ║  Mass-copy behaviour detected by kernel driver!      ║\n");
+        printf("  ║  Burst: %u file ops in %u ms (threshold: %u)         ║\n",
+               anom.burst_count, anom.window_ms, anom.threshold);
+        printf("  ╚══════════════════════════════════════════════════════╝\n");
+        printf("\n");
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Subroutine: Set anomaly detection thresholds via ioctl
+ * ------------------------------------------------------------------------- */
+static void set_anomaly_thresholds(int fd, __u32 threshold, __u32 window_ms)
+{
+    usb_audit_anomaly_t anom;
+
+    memset(&anom, 0, sizeof(anom));
+    anom.threshold = threshold;
+    anom.window_ms = window_ms;
+
+    if (ioctl(fd, USB_AUDIT_SET_ANOMALY, &anom) < 0) {
+        perror("ioctl(SET_ANOMALY)");
+        return;
+    }
+
+    printf("  Anomaly config updated: threshold=%u ops, window=%u ms\n",
+           threshold, window_ms);
+}
+
+/* -------------------------------------------------------------------------
  * Subroutine: Fetch and print aggregate statistics
  * ------------------------------------------------------------------------- */
 static void print_stats(int fd)
@@ -209,8 +258,9 @@ static void interactive_menu(int fd)
     printf("│  C <path>  — Report file CREATE event                  │\n");
     printf("│  M <path>  — Report file MODIFY event                  │\n");
     printf("│  D <path>  — Report file DELETE event                  │\n");
-    printf("│  A         — Trigger anomaly ALERT                     │\n");
-    printf("│  S         — Show current stats                        │\n");
+    printf("│  A         — Manually trigger ALERT                    │\n");
+    printf("│  T <n> <ms>— Set anomaly threshold & window            │\n");
+    printf("│  S         — Show current stats + anomaly status       │\n");
     printf("│  L         — Show recent logs                          │\n");
     printf("│  R         — Reset statistics                          │\n");
     printf("│  X         — Clear all logs                            │\n");
@@ -236,19 +286,24 @@ static void interactive_menu(int fd)
         case 'S': case 's':
             print_header();
             print_stats(fd);
+            check_anomaly_status(fd);
             print_logs(fd, 10);
             break;
 
         case 'L': case 'l':
             print_header();
+            check_anomaly_status(fd);
             print_logs(fd, 10);
             break;
 
         case 'R': case 'r':
             if (ioctl(fd, USB_AUDIT_RESET_STATS) < 0)
                 perror("ioctl(RESET_STATS)");
-            else
-                printf("  Statistics reset.\n");
+            else {
+                printf("  Statistics and anomaly ring reset.\n");
+                /* Also reset anomaly ring on kernel side — RESET_STATS
+                 * now clears the anomaly ring as well.                    */
+            }
             break;
 
         case 'X': case 'x':
@@ -276,13 +331,39 @@ static void interactive_menu(int fd)
             }
             send_event(fd, (char)(code == 'C' ? 'C' : code == 'M' ? 'M' : 'D'),
                        p, 1024);
+            /* Auto-check: did this event trigger a kernel-side alert? */
+            check_anomaly_status(fd);
             break;
         }
 
         case 'A': case 'a':
             send_event(fd, 'A', "mass_copy_alert", 0);
             printf("  *** SECURITY ALERT TRIGGERED ***\n");
+            check_anomaly_status(fd);
             break;
+
+        case 'T': case 't': {
+            /* Parse: T <threshold> <window_ms> */
+            int thr = 0, win = 0;
+            if (sscanf(line + 1, "%d %d", &thr, &win) >= 2) {
+                set_anomaly_thresholds(fd, (__u32)thr, (__u32)win);
+            } else if (sscanf(line + 1, "%d", &thr) >= 1) {
+                /* Only threshold given — keep current window. */
+                usb_audit_anomaly_t anom;
+                memset(&anom, 0, sizeof(anom));
+                if (ioctl(fd, USB_AUDIT_GET_ANOMALY, &anom) == 0)
+                    win = (int)anom.window_ms;
+                if (win == 0) win = ANOMALY_WINDOW_SEC * 1000;
+                set_anomaly_thresholds(fd, (__u32)thr, (__u32)win);
+            } else {
+                printf("  Usage: T <threshold> [window_ms]\n");
+                printf("  Current defaults: threshold=%d, window=%d ms\n",
+                       ANOMALY_THRESHOLD, (int)(ANOMALY_WINDOW_SEC * 1000));
+                /* Show current kernel-side config too. */
+                check_anomaly_status(fd);
+            }
+            break;
+        }
 
         default:
             printf("  Unknown command '%c'.  Type Q to quit.\n", code);
@@ -302,6 +383,7 @@ static void daemon_mode(int fd)
     while (keep_running) {
         print_header();
         print_stats(fd);
+        check_anomaly_status(fd);
         print_logs(fd, 8);
         printf("\n  Refreshing every %d s.  Press Ctrl+C to quit.\n",
                MENU_REFRESH_SEC);
@@ -319,22 +401,28 @@ static void print_usage(const char *prog)
         "USB File Transfer Activity Monitor — Group 10\n"
         "\n"
         "Options:\n"
-        "  -i, --interactive    Interactive test menu (default)\n"
-        "  -d, --daemon         Periodic dashboard refresh mode\n"
-        "  -p, --path <path>    Set monitored USB mount path\n"
-        "  -h, --help           Show this help message\n"
+        "  -i, --interactive      Interactive test menu (default)\n"
+        "  -d, --daemon           Periodic dashboard refresh mode\n"
+        "  -p, --path <path>      Set monitored USB mount path\n"
+        "  -t, --threshold <n>    Anomaly: max file ops before alert\n"
+        "  -w, --window <ms>      Anomaly: sliding time window (ms)\n"
+        "  -h, --help             Show this help message\n"
         "\n"
         "In interactive mode, commands are:\n"
-        "  C <path>   Report file CREATE event\n"
-        "  M <path>   Report file MODIFY event\n"
-        "  D <path>   Report file DELETE event\n"
-        "  A          Trigger anomaly ALERT\n"
-        "  S          Show current stats\n"
-        "  L          Show recent logs\n"
-        "  R          Reset statistics\n"
-        "  X          Clear all logs\n"
-        "  Q          Quit\n",
-        prog);
+        "  C <path>     Report file CREATE event\n"
+        "  M <path>     Report file MODIFY event\n"
+        "  D <path>     Report file DELETE event\n"
+        "  A            Manually trigger anomaly ALERT\n"
+        "  T <n> <ms>   Set anomaly threshold & window (ms)\n"
+        "  S            Show current stats + anomaly status\n"
+        "  L            Show recent logs\n"
+        "  R            Reset statistics + anomaly ring\n"
+        "  X            Clear all logs\n"
+        "  Q            Quit\n"
+        "\n"
+        "Kernel auto-detection fires ALERT when file ops exceed threshold\n"
+        "within the sliding time window (default: %d ops / %.0f s).\n",
+        prog, ANOMALY_THRESHOLD, ANOMALY_WINDOW_SEC);
 }
 
 /* =========================================================================
@@ -345,6 +433,8 @@ int main(int argc, char *argv[])
     int  fd;
     int  mode_interactive = 1;   /* 1 = interactive, 0 = daemon            */
     const char *mount_path = "/media";
+    int  anomaly_thr = ANOMALY_THRESHOLD;
+    int  anomaly_win = (int)(ANOMALY_WINDOW_SEC * 1000);
     int  i;
 
     /* -- Parse command-line arguments ---------------------------------- */
@@ -361,6 +451,14 @@ int main(int argc, char *argv[])
         } else if ((strcmp(argv[i], "-p") == 0 ||
                     strcmp(argv[i], "--path") == 0) && i + 1 < argc) {
             mount_path = argv[++i];
+        } else if ((strcmp(argv[i], "-t") == 0 ||
+                    strcmp(argv[i], "--threshold") == 0) && i + 1 < argc) {
+            anomaly_thr = atoi(argv[++i]);
+            if (anomaly_thr < 1) anomaly_thr = 1;
+        } else if ((strcmp(argv[i], "-w") == 0 ||
+                    strcmp(argv[i], "--window") == 0) && i + 1 < argc) {
+            anomaly_win = atoi(argv[++i]);
+            if (anomaly_win < 100) anomaly_win = 100;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -388,6 +486,19 @@ int main(int argc, char *argv[])
         perror("ioctl(SET_PATH)");
     else
         printf("[usb_monitor] Monitor path set to: %s\n", mount_path);
+
+    /* -- Apply anomaly detection config to kernel module --------------- */
+    {
+        usb_audit_anomaly_t anom;
+        memset(&anom, 0, sizeof(anom));
+        anom.threshold = (__u32)anomaly_thr;
+        anom.window_ms = (__u32)anomaly_win;
+        if (ioctl(fd, USB_AUDIT_SET_ANOMALY, &anom) < 0)
+            perror("ioctl(SET_ANOMALY) — kernel may not support anomaly");
+        else
+            printf("[usb_monitor] Anomaly: threshold=%d ops, window=%d ms\n",
+                   anomaly_thr, anomaly_win);
+    }
 
     /* -- Enter the appropriate run mode -------------------------------- */
     if (mode_interactive)

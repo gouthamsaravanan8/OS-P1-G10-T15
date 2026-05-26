@@ -169,10 +169,12 @@ The C application communicates with the kernel driver through the `/dev/usb_audi
 Usage: ./usb_monitor [OPTION]
 
 Options:
-  -i, --interactive    Interactive test menu (default)
-  -d, --daemon         Periodic dashboard refresh mode
-  -p, --path <path>    Set monitored USB mount path
-  -h, --help           Show this help message
+  -i, --interactive      Interactive test menu (default)
+  -d, --daemon           Periodic dashboard refresh mode
+  -p, --path <path>      Set monitored USB mount path
+  -t, --threshold <n>    Anomaly: max file ops before alert (default: 5)
+  -w, --window <ms>      Anomaly: sliding time window in ms (default: 3000)
+  -h, --help             Show this help message
 ```
 
 #### Interactive Mode Commands
@@ -182,10 +184,11 @@ Options:
 | `C <path>` | Report a file CREATE event |
 | `M <path>` | Report a file MODIFY event |
 | `D <path>` | Report a file DELETE event |
-| `A` | Trigger an anomaly ALERT |
-| `S` | Show current transfer statistics |
+| `A` | Manually trigger an anomaly ALERT |
+| `T <n> <ms>` | Set anomaly threshold & sliding window |
+| `S` | Show current transfer statistics + anomaly status |
 | `L` | Show recent log entries |
-| `R` | Reset all statistics counters |
+| `R` | Reset all statistics counters + anomaly ring |
 | `X` | Clear the log buffer |
 | `Q` | Quit the application |
 
@@ -193,7 +196,56 @@ Options:
 
 Shows a periodically-refreshing dashboard with:
 - Aggregate transfer statistics (bytes written, file counts, device events, alerts)
+- Anomaly detection status (auto-checked every refresh cycle)
 - The 8 most recent log entries
+
+---
+
+## Advanced Challenge: Automatic Mass-Copy Anomaly Detection ✅
+
+The advanced challenge goal ("Detect suspicious mass-copy behavior and trigger alerts") is **fully implemented** across all three layers:
+
+### 1. Kernel-Side Auto-Detection (`usb_audit.c`)
+
+- Maintains a **64-entry ring buffer** of file-event timestamps.
+- After every `FILE_CREATE` or `FILE_MODIFY` event, scans the ring buffer to count how many events fall within the configured **sliding time window**.
+- If the count exceeds the **threshold** AND the **cooldown period** (5 s) has elapsed, the kernel **automatically**:
+  - Logs a `USB_AUDIT_EVENT_ALERT` entry into the circular log buffer.
+  - Emits a `printk(KERN_WARNING)` message visible in `dmesg`.
+  - Increments the `alert_count` statistic.
+- Configurable at runtime via `USB_AUDIT_SET_ANOMALY` / `USB_AUDIT_GET_ANOMALY` ioctls.
+
+### 2. User-Space Auto-Check (`usb_monitor.c`)
+
+- After every `C` / `M` command in interactive mode, queries the kernel's anomaly status.
+- If `alert_triggered == 1`, displays a prominent **security warning banner**.
+- Daemon mode checks every refresh cycle.
+- Threshold and window configurable via `T` command or CLI `-t` / `-w` options.
+
+### 3. Python-Side Detection (`file_tracker.py`)
+
+- Independent sliding-window implementation using the `watchdog` library.
+- Triggers `[SECURITY ALERT]` messages on the console.
+
+#### Testing the Auto-Detection
+
+```bash
+# In the interactive monitor:
+C file1.txt
+C file2.txt
+C file3.txt
+C file4.txt
+C file5.txt
+C file6.txt    # ← 6th file op within 3s → ALERT fires automatically!
+
+# Observe in dmesg:
+dmesg | grep "SECURITY ALERT"
+# [usb_audit] *** SECURITY ALERT *** Mass-copy detected!  6 file ops within 3000 ms (threshold=5)
+
+# Or with custom thresholds:
+sudo ./src_user/usb_monitor -i -t 3 -w 2000
+# Alert fires after just 4 file ops within 2 seconds.
+```
 
 ### Python Application (`file_tracker.py`)
 
