@@ -345,8 +345,20 @@ static void interactive_menu(int fd)
             /* Parse: T <threshold> <window_ms> */
             int thr = 0, win = 0;
             if (sscanf(line + 1, "%d %d", &thr, &win) >= 2) {
+                if (thr < 1) {
+                    printf("  Error: threshold must be at least 1.\n");
+                    break;
+                }
+                if (win < 100) {
+                    printf("  Error: window must be at least 100 ms.\n");
+                    break;
+                }
                 set_anomaly_thresholds(fd, (__u32)thr, (__u32)win);
             } else if (sscanf(line + 1, "%d", &thr) >= 1) {
+                if (thr < 1) {
+                    printf("  Error: threshold must be at least 1.\n");
+                    break;
+                }
                 /* Only threshold given — keep current window. */
                 usb_audit_anomaly_t anom;
                 memset(&anom, 0, sizeof(anom));

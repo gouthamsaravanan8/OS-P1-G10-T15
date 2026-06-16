@@ -35,6 +35,9 @@
 #include <linux/timekeeping.h>    /* ktime_get_real_ns                  */
 #include <linux/string.h>         /* strncpy, strnlen                   */
 #include <linux/ktime.h>          /* ktime_t, ktime_sub, ktime_after    */
+#include <linux/kprobes.h>        /* kprobe, kretprobe, register_kretprobe */
+#include <linux/dcache.h>         /* d_path                              */
+#include <linux/path.h>           /* struct path                         */
 
 #include "../include/usb_tracker.h"
 
@@ -80,6 +83,193 @@ static int      anomaly_ring_count= 0;    /* valid entries in ring            */
 static __u32    anomaly_threshold = USB_AUDIT_DEFAULT_THRESHOLD; /* max ops   */
 static __u32    anomaly_window_ms = USB_AUDIT_DEFAULT_WINDOW_MS; /* window   */
 static ktime_t  anomaly_last_alert;       /* timestamp of last alert raised  */
+
+/* Kprobe registration flag — true when vfs_write kretprobe is active. */
+static bool kprobe_registered = false;
+
+/* Module parameter: disable kprobe at load time if needed. */
+static bool enable_kprobe = true;
+module_param(enable_kprobe, bool, 0644);
+MODULE_PARM_DESC(enable_kprobe,
+                 "Enable kretprobe on vfs_write for kernel-level file monitoring");
+
+/* =========================================================================
+ * Atomic Logging Helper (safe for kprobe / atomic context)
+ * =========================================================================
+ * kprobe handlers run with preemption disabled, so mutex_lock() would
+ * sleep and trigger a kernel BUG.  This helper uses mutex_trylock()
+ * instead — if the mutex is contended the event is silently dropped,
+ * which is safe and acceptable for a university demonstration.
+ */
+static void audit_log_event_atomic(enum usb_audit_event_type type,
+                                   __u32 pid, __u64 size, const char *name)
+{
+    usb_audit_log_entry_t *entry;
+    ktime_t now;
+
+    if (!log_buffer)
+        return;
+
+    if (!mutex_trylock(&audit_mutex))
+        return;   /* contended — safe to skip this event */
+
+    entry = &log_buffer[log_head];
+    now = ktime_get_real_ns();
+    entry->event_type   = (__u8)type;
+    entry->pid          = pid;
+    entry->timestamp_ns = now;
+    entry->file_size    = size;
+
+    if (name) {
+        strncpy(entry->file_name, name, sizeof(entry->file_name) - 1);
+        entry->file_name[sizeof(entry->file_name) - 1] = '\0';
+    } else {
+        entry->file_name[0] = '\0';
+    }
+
+    log_head = (log_head + 1) % USB_AUDIT_LOG_MAX;
+    if (log_count < USB_AUDIT_LOG_MAX)
+        log_count++;
+
+    switch (type) {
+    case USB_AUDIT_EVENT_FILE_CREATE:
+        stats.total_files_created++;
+        stats.total_bytes_written += size;
+        anomaly_check_burst(now);
+        break;
+    case USB_AUDIT_EVENT_FILE_MODIFY:
+        stats.total_files_modified++;
+        stats.total_bytes_written += size;
+        anomaly_check_burst(now);
+        break;
+    default:
+        break;
+    }
+
+    stats.log_count = log_count;
+    mutex_unlock(&audit_mutex);
+}
+
+/* =========================================================================
+ * Kprobe-based File Write Interception (Gap 1 Fix)
+ * =========================================================================
+ * Intercepts every vfs_write() call via a kretprobe so the driver can
+ * autonomously detect file writes to the monitored USB mount point
+ * *without* relying on user-space to report them.  The entry handler
+ * saves the file pointer and requested write size; the return handler
+ * checks whether the target file resides under monitored_path and, if
+ * so, logs the event (which also feeds the anomaly detection engine).
+ *
+ * Performance note: d_path() + kmalloc(GFP_ATOMIC) runs on every
+ * regular-file write system-wide.  A production implementation would
+ * first compare the file's superblock against a cached reference to
+ * avoid the allocation on unrelated writes.
+ */
+
+struct vfs_write_ctx {
+    struct file *filp;
+    size_t       count;
+};
+
+/* Entry handler — called before vfs_write executes. */
+static int krp_vfs_write_entry(struct kretprobe_instance *ri,
+                               struct pt_regs *regs)
+{
+    struct vfs_write_ctx *ctx = (struct vfs_write_ctx *)ri->data;
+
+    /*
+     * ARM64 (Raspberry Pi 4) calling convention:
+     *   x0 = struct file *file
+     *   x1 = const char __user *buf
+     *   x2 = size_t count
+     *   x3 = loff_t *pos
+     */
+    ctx->filp  = (struct file *)regs->regs[0];
+    ctx->count = (size_t)regs->regs[2];
+
+    return 0;   /* always allow the probed function to execute */
+}
+
+/* Return handler — called after vfs_write returns. */
+static int krp_vfs_write_ret(struct kretprobe_instance *ri,
+                             struct pt_regs *regs)
+{
+    struct vfs_write_ctx *ctx = (struct vfs_write_ctx *)ri->data;
+    ssize_t retval;
+    char   *path_buf;
+    char   *path;
+    struct inode *inode;
+    enum usb_audit_event_type event_type;
+    size_t monitor_len;
+
+    /* ARM64: return value is in x0. */
+    retval = (ssize_t)regs->regs[0];
+
+    /* Skip failed / zero-length writes and bogus file pointers. */
+    if (retval <= 0 || !ctx->filp || !ctx->filp->f_path.dentry)
+        return 0;
+
+    inode = ctx->filp->f_path.dentry->d_inode;
+    if (!inode)
+        return 0;
+
+    /* Only regular files — ignore pipes, sockets, device nodes, etc. */
+    if (!S_ISREG(inode->i_mode))
+        return 0;
+
+    /*
+     * Resolve the full absolute path via d_path().  This returns the
+     * path as visible to the writing process (respects mount namespaces).
+     * d_path takes the d_lock spinlock and is safe in kprobe context.
+     */
+    path_buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+    if (!path_buf)
+        return 0;
+
+    path = d_path(&ctx->filp->f_path, path_buf, PATH_MAX);
+    if (IS_ERR(path)) {
+        kfree(path_buf);
+        return 0;
+    }
+
+    /* Fast prefix check: is this write inside the monitored tree? */
+    monitor_len = strnlen(monitored_path, USB_AUDIT_PATH_LEN);
+    if (strncmp(path, monitored_path, monitor_len) != 0) {
+        kfree(path_buf);
+        return 0;   /* unrelated write — ignore */
+    }
+
+    /*
+     * Heuristic: if the file was empty before this write (or the amount
+     * written equals/exceeds the prior size, suggesting a new or
+     * truncated file), classify as CREATE; otherwise MODIFY.
+     */
+    {
+        loff_t prev_size = i_size_read(inode);
+        if (prev_size == 0 || (loff_t)retval >= prev_size)
+            event_type = USB_AUDIT_EVENT_FILE_CREATE;
+        else
+            event_type = USB_AUDIT_EVENT_FILE_MODIFY;
+    }
+
+    /*
+     * Log the event into the circular buffer (atomic-safe variant).
+     * This also feeds the anomaly detection engine, so rapid successive
+     * writes to the USB device will trigger a mass-copy alert.
+     */
+    audit_log_event_atomic(event_type, current->pid, (__u64)retval, path);
+
+    kfree(path_buf);
+    return 0;
+}
+
+/* kretprobe descriptor — symbol resolved at registration time. */
+static struct kretprobe krp_vfs_write = {
+    .handler       = krp_vfs_write_ret,
+    .entry_handler = krp_vfs_write_entry,
+    .data_size     = sizeof(struct vfs_write_ctx),
+    .maxactive     = 20,   /* max simultaneous probe instances */
+};
 
 /* =========================================================================
  * Anomaly Detection: Check for mass-copy (burst) behaviour
@@ -673,6 +863,25 @@ static int __init usb_audit_init(void)
     usb_register_notify(&usb_nb);
     printk(KERN_INFO "[usb_audit] USB hotplug notifier registered\n");
 
+    /* -- 7. Register kretprobe on vfs_write (kernel-level monitoring) - */
+    if (enable_kprobe) {
+        krp_vfs_write.kp.symbol_name = "vfs_write";
+        ret = register_kretprobe(&krp_vfs_write);
+        if (ret < 0) {
+            printk(KERN_WARNING "[usb_audit] kretprobe on vfs_write failed "
+                   "(err=%d).  Kernel-level file interception unavailable; "
+                   "falling back to user-space-only event reporting.\n", ret);
+            /* Non-fatal: the driver still works via /dev/usb_audit write(). */
+        } else {
+            kprobe_registered = true;
+            printk(KERN_INFO "[usb_audit] kretprobe on vfs_write registered "
+                   "— kernel-level file write interception ACTIVE\n");
+        }
+    } else {
+        printk(KERN_INFO "[usb_audit] kprobe disabled by module parameter; "
+               "user-space event reporting only.\n");
+    }
+
     printk(KERN_INFO "[usb_audit] Driver loaded successfully.  "
            "Device node: /dev/%s\n", USB_AUDIT_DEVICE_NAME);
 
@@ -697,6 +906,13 @@ static void __exit usb_audit_exit(void)
 {
     printk(KERN_INFO "[usb_audit] Shutting down USB File Transfer Activity "
            "Driver\n");
+
+    /* Unregister the vfs_write kretprobe (stop kernel-level interception). */
+    if (kprobe_registered) {
+        unregister_kretprobe(&krp_vfs_write);
+        kprobe_registered = false;
+        printk(KERN_INFO "[usb_audit] kretprobe on vfs_write unregistered\n");
+    }
 
     /* Unregister USB notifier first so no new events arrive. */
     usb_unregister_notify(&usb_nb);
