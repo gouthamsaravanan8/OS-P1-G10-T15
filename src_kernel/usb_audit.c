@@ -32,11 +32,11 @@
 #include <linux/mutex.h>          /* mutex_lock, mutex_unlock           */
 #include <linux/usb.h>            /* usb_register_notify, usb_device    */
 #include <linux/notifier.h>       /* NOTIFY_DONE, notifier_block        */
-#include <linux/genhd.h>          /* gendisk, block device iteration    */
 #include <linux/blkdev.h>         /* block_device operations            */
 #include <linux/timekeeping.h>    /* ktime_get_real_ns                  */
 #include <linux/string.h>         /* strncpy, strnlen                   */
 #include <linux/ktime.h>          /* ktime_t, ktime_sub, ktime_after    */
+#include <linux/version.h>        /* LINUX_VERSION_CODE check           */
 
 #include "../include/usb_tracker.h"
 
@@ -170,7 +170,7 @@ static void audit_log_event(enum usb_audit_event_type type,
     entry = &log_buffer[log_head];
     entry->event_type    = (__u8)type;
     entry->pid           = pid;
-    entry->timestamp_ns  = ktime_get_real_ns();
+    entry->timestamp_ns  = ktime_get_ns();
     entry->file_size     = size;
 
     if (name) {
@@ -323,6 +323,7 @@ static ssize_t usb_audit_read(struct file *filp, char __user *buf,
     log_count--;
     stats.log_count = log_count;
     ret = sizeof(usb_audit_log_entry_t);
+    *f_pos += ret;
 
     mutex_unlock(&audit_mutex);
     return ret;
@@ -347,6 +348,8 @@ static ssize_t usb_audit_write(struct file *filp, const char __user *buf,
     char event_code;
     char *file_path;
     enum usb_audit_event_type type;
+    unsigned long long parsed_size = 0;
+    char *paren;
 
     if (count == 0)
         return 0;
@@ -392,12 +395,24 @@ static ssize_t usb_audit_write(struct file *filp, const char __user *buf,
             file_path[--len] = '\0';
     }
 
-    printk(KERN_INFO "[usb_audit] Event from PID %d: type=%d path=%s\n",
-           current->pid, type, file_path);
+    /* Parse optional size suffix: " (X bytes)" at the end of the string */
+    paren = strrchr(file_path, '(');
+    if (paren && paren > file_path) {
+        if (sscanf(paren, "(%llu bytes)", &parsed_size) == 1) {
+            char *space = paren - 1;
+            if (space >= file_path && *space == ' ') {
+                *space = '\0';
+            } else {
+                *paren = '\0';
+            }
+        }
+    }
 
-    /* Record the event.  file_size=0 here; the user app can update
-     * size via a different mechanism if needed.                         */
-    audit_log_event(type, current->pid, 0, file_path);
+    printk(KERN_INFO "[usb_audit] Event from PID %d: type=%d path=%s size=%llu\n",
+           current->pid, type, file_path, parsed_size);
+
+    /* Record the event with the parsed file size. */
+    audit_log_event(type, current->pid, (__u64)parsed_size, file_path);
 
     return count;
 }
@@ -534,7 +549,7 @@ static long usb_audit_ioctl(struct file *filp, unsigned int cmd,
         ktime_t now, window_start;
 
         memset(&kanom, 0, sizeof(kanom));
-        now = ktime_get_real();
+        now = ktime_get();
 
         mutex_lock(&audit_mutex);
         kanom.threshold = anomaly_threshold;
@@ -612,7 +627,11 @@ static int __init usb_audit_init(void)
     }
 
     /* -- 3. Create device class and populate /dev/usb_audit ----------- */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
     usb_audit_class = class_create(USB_AUDIT_DEVICE_NAME);
+#else
+    usb_audit_class = class_create(THIS_MODULE, USB_AUDIT_DEVICE_NAME);
+#endif
     if (IS_ERR(usb_audit_class)) {
         ret = PTR_ERR(usb_audit_class);
         printk(KERN_ERR "[usb_audit] class_create failed: %d\n", ret);

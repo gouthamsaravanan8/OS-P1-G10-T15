@@ -18,6 +18,15 @@ class USBMonitorHandler(FileSystemEventHandler):
         # Stores timestamps of recent file modifications
         self.modification_history = []
 
+    def send_kernel_event(self, code, path, size):
+        try:
+            fd = os.open("/dev/usb_audit", os.O_WRONLY)
+            event_str = f"{code} {path} ({size} bytes)\n"
+            os.write(fd, event_str.encode('utf-8'))
+            os.close(fd)
+        except Exception as e:
+            print(f"[WARN] Failed to write event to /dev/usb_audit: {e}")
+
     def check_anomaly(self, current_time):
         # Sliding window filter: remove events outside our target time window
         self.modification_history = [
@@ -39,6 +48,11 @@ class USBMonitorHandler(FileSystemEventHandler):
         self.check_anomaly(now)
 
         print(f"[NEW_FILE] Detect: {event.src_path}")
+        try:
+            size = os.path.getsize(event.src_path)
+        except FileNotFoundError:
+            size = 0
+        self.send_kernel_event('C', event.src_path, size)
 
     def on_modified(self, event):
         if event.is_directory:
@@ -60,8 +74,15 @@ class USBMonitorHandler(FileSystemEventHandler):
         try:
             final_size = os.path.getsize(event.src_path)
             print(f"[SUCCESS]  Sync complete: {event.src_path} ({final_size} bytes)")
+            self.send_kernel_event('M', event.src_path, final_size)
         except FileNotFoundError:
             pass
+
+    def on_deleted(self, event):
+        if event.is_directory:
+            return
+        print(f"[DELETED]  Path: {event.src_path}")
+        self.send_kernel_event('D', event.src_path, 0)
 
 def main():
     if not os.path.exists(USB_TARGET_PATH):
